@@ -1,0 +1,47 @@
+# PacketBridge LAN File Transfer — Project Requirements (requirement.text)
+# =========================================================================
+# System & Runtime Requirements
+# - Node.js >= 20.0.0 (Tested with Node v22.x)
+# - npm >= 10.0.0
+# - Supported Operating Systems: Windows 10/11, macOS 13+, Linux, Android (via Chrome/Firefox Mobile over Wi-Fi or Hotspot)
+# - Local Network Port: TCP 3000 (0.0.0.0:3000 for LAN / Hotspot Network IP access)
+
+# Core Runtime Dependencies (npm packages)
+express==4.21.2
+ws==8.22.1
+tsx==4.21.0
+esbuild==0.28.0
+react==19.0.1
+react-dom==19.0.1
+lucide-react==0.546.0
+motion==12.23.24
+dotenv==17.2.3
+@google/genai==2.4.0
+
+# Build & Development Dependencies
+vite==8.3.0
+@vitejs/plugin-react==6.1.1
+tailwindcss==4.3.3
+@tailwindcss/vite==4.3.3
+typescript==7.0.2
+autoprefixer==10.4.21
+@types/node==22.14.0
+@types/express==4.17.21
+@types/ws==8.18.2
+@types/react==19.3.0
+@types/react-dom==19.3.0
+
+# Built-in Node.js Modules Used (Zero Extra Install Required)
+# - fs / fs/promises (Real directory scanning and binary chunk offset writing)
+# - crypto (SHA-256 file integrity verification)
+# - os (Real local Wi-Fi / LAN IPv4 interface detection)
+# - http / path / url
+# - node:test / node:assert/strict (Unit testing)
+
+# Quick Start & Network IP Access Commands (Windows / macOS / Linux):
+# 1. Install dependencies (including tsx and esbuild):
+#    npm install --legacy-peer-deps
+# 2. Run local server bound to all network interfaces (0.0.0.0:3000):
+#    npm run dev
+# 3. Access from any device on the same Wi-Fi or Hotspot via Network IP:
+#    http://<YOUR-LAN-OR-HOTSPOT-IP>:3000

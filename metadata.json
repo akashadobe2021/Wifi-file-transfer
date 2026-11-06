@@ -1,0 +1,6 @@
+{
+  "name": "PacketBridge LAN File Transfer",
+  "description": "Cross-platform local network chunked file transfer workspace with concurrent multi-file streams, dual-endpoint folder management, and activity logging.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
