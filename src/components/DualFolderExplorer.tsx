@@ -12,14 +12,17 @@ import {
   CornerLeftUp,
   Upload,
   ArrowRightLeft,
+  FolderInput,
 } from 'lucide-react';
 import {
   formatByteSize,
   getParentVirtualPath,
+  filterEndpointDiskData,
   type EndpointRole,
   type FolderNode,
   type TransferredFileRecord,
   type DiskDrivePreset,
+  type LobbyPeer,
 } from '../utils/transferEngine';
 
 export interface NetworkInterfaceItem {
@@ -39,12 +42,17 @@ export interface SystemNodeInfo {
   port: number;
   hostDiskRoot?: string;
   receiverDiskRoot?: string;
+  receiverDiskLabel?: string;
   availableDrives?: DiskDrivePreset[];
 }
+
+type DiskViewFilter = 'both' | 'host' | 'receiver';
 
 interface DualFolderExplorerProps {
   nodeInfo: SystemNodeInfo | null;
   clientPlatform: string;
+  clientRole: EndpointRole;
+  activePairedPeer: LobbyPeer | null;
   folders: FolderNode[];
   completedFiles: TransferredFileRecord[];
   selectedHostFolder: string;
@@ -54,6 +62,7 @@ interface DualFolderExplorerProps {
     endpoint: EndpointRole,
     diskPath: string
   ) => Promise<{ ok: boolean; error?: string; diskRoot?: string }>;
+  onSyncReceiverLocalFolder: (folderLabel: string, files: File[]) => Promise<void>;
   onCreateFolder: (
     endpoint: EndpointRole,
     parentPath: string,
@@ -75,17 +84,21 @@ interface DualFolderExplorerProps {
 export const DualFolderExplorer: React.FC<DualFolderExplorerProps> = ({
   nodeInfo,
   clientPlatform,
+  clientRole,
+  activePairedPeer,
   folders,
   completedFiles,
   selectedHostFolder,
   selectedReceiverFolder,
   onSelectFolder,
   onMountDiskPath,
+  onSyncReceiverLocalFolder,
   onCreateFolder,
   onUploadFilesToEndpoint,
   onTransferDiskFile,
   onDeleteFile,
 }) => {
+  const [diskViewFilter, setDiskViewFilter] = useState<DiskViewFilter>('both');
   const [hostFolderInput, setHostFolderInput] = useState('');
   const [receiverFolderInput, setReceiverFolderInput] = useState('');
   const [hostDiskInput, setHostDiskInput] = useState('');
@@ -97,10 +110,14 @@ export const DualFolderExplorer: React.FC<DualFolderExplorerProps> = ({
 
   const hostFilePickerRef = useRef<HTMLInputElement | null>(null);
   const receiverFilePickerRef = useRef<HTMLInputElement | null>(null);
+  const receiverDirectoryPickerRef = useRef<HTMLInputElement | null>(null);
 
-  const hostFolders = folders.filter((f) => f.endpoint === 'host');
-  const receiverFolders = folders.filter((f) => f.endpoint === 'receiver');
-  const availableDrives = nodeInfo?.availableDrives || [];
+  // Strictly isolate Host disk data from Receiver disk data
+  const hostDiskData = filterEndpointDiskData(folders, completedFiles, 'host');
+  const receiverDiskData = filterEndpointDiskData(folders, completedFiles, 'receiver');
+
+  // Host OS drives belong strictly to the Host Device Disk section
+  const hostOnlyAvailableDrives = nodeInfo?.availableDrives || [];
 
   const handleMountDrive = async (endpoint: EndpointRole, diskPath: string) => {
     if (endpoint === 'host') {
@@ -120,10 +137,10 @@ export const DualFolderExplorer: React.FC<DualFolderExplorerProps> = ({
 
     if (endpoint === 'host') {
       setHostDiskInput('');
-      setHostSuccess(`Mounted disk drive: ${res.diskRoot || diskPath}`);
+      setHostSuccess(`Mounted Host disk drive: ${res.diskRoot || diskPath}`);
     } else {
       setReceiverDiskInput('');
-      setReceiverSuccess(`Mounted disk drive: ${res.diskRoot || diskPath}`);
+      setReceiverSuccess(`Mounted Receiver disk drive: ${res.diskRoot || diskPath}`);
     }
   };
 
@@ -151,10 +168,10 @@ export const DualFolderExplorer: React.FC<DualFolderExplorerProps> = ({
 
     if (endpoint === 'host') {
       setHostFolderInput('');
-      setHostSuccess(`Created folder in ${parentPath}`);
+      setHostSuccess(`Created folder in ${parentPath} on Host Disk`);
     } else {
       setReceiverFolderInput('');
-      setReceiverSuccess(`Created folder in ${parentPath}`);
+      setReceiverSuccess(`Created folder in ${parentPath} on Receiver Disk`);
     }
   };
 
@@ -210,12 +227,37 @@ export const DualFolderExplorer: React.FC<DualFolderExplorerProps> = ({
       return;
     }
 
-    const targetLabel = sourceEndpoint === 'host' ? 'Receiver Disk' : 'Host Disk';
+    const targetLabel =
+      sourceEndpoint === 'host'
+        ? activePairedPeer
+          ? `${activePairedPeer.name}'s Receiver Disk`
+          : 'Receiver Disk'
+        : 'Host Disk';
     if (sourceEndpoint === 'host') {
       setHostSuccess(`Transferred "${fileName}" directly to ${targetLabel}`);
     } else {
       setReceiverSuccess(`Transferred "${fileName}" directly to ${targetLabel}`);
     }
+  };
+
+  const handleReceiverFolderSelection = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const fileList = e.target.files ? Array.from(e.target.files) : [];
+    if (fileList.length === 0) return;
+
+    setReceiverError(null);
+    setReceiverSuccess(null);
+
+    const firstRel = (fileList[0] as File & { webkitRelativePath?: string }).webkitRelativePath || '';
+    const detectedFolderName = firstRel.split('/')[0] || 'Receiver Local Folder';
+    const label = `${activePairedPeer?.name || 'Receiver'} · ${detectedFolderName}`;
+
+    await onSyncReceiverLocalFolder(label, fileList);
+    setReceiverSuccess(
+      `Mounted Receiver local folder "${detectedFolderName}" (${fileList.length} file${
+        fileList.length === 1 ? '' : 's'
+      })`
+    );
+    e.target.value = '';
   };
 
   const renderEndpointPane = (
@@ -224,6 +266,7 @@ export const DualFolderExplorer: React.FC<DualFolderExplorerProps> = ({
     deviceSubtitle: string,
     activeDiskRoot: string,
     endpointFolders: FolderNode[],
+    endpointFiles: TransferredFileRecord[],
     selectedPath: string,
     folderInput: string,
     setFolderInput: (val: string) => void,
@@ -233,9 +276,7 @@ export const DualFolderExplorer: React.FC<DualFolderExplorerProps> = ({
     successMsg: string | null,
     pickerRef: React.RefObject<HTMLInputElement | null>
   ) => {
-    const filesInFolder = completedFiles.filter(
-      (f) => f.targetEndpoint === endpoint && f.targetFolderPath === selectedPath
-    );
+    const filesInFolder = endpointFiles.filter((f) => f.targetFolderPath === selectedPath);
 
     const visibleFolders = endpointFolders.filter(
       (f) =>
@@ -245,23 +286,55 @@ export const DualFolderExplorer: React.FC<DualFolderExplorerProps> = ({
     );
 
     const DeviceIcon = endpoint === 'host' ? Laptop : Smartphone;
-    const otherEndpointLabel = endpoint === 'host' ? 'Receiver' : 'Host';
+    const otherEndpointLabel =
+      endpoint === 'host'
+        ? activePairedPeer
+          ? activePairedPeer.name
+          : 'Receiver'
+        : 'Host';
+    const isMyOwnEndpoint = clientRole === endpoint;
 
     return (
       <section
         aria-label={`${title} Directory Manager`}
-        className="bg-white border border-slate-200/90 rounded-2xl p-4 sm:p-6 shadow-2xs flex flex-col justify-between gap-6 overflow-hidden"
+        className={`bg-white border rounded-2xl p-4 sm:p-6 shadow-2xs flex flex-col justify-between gap-6 overflow-hidden ${
+          endpoint === 'host'
+            ? 'border-blue-200/90'
+            : 'border-emerald-200/90'
+        }`}
       >
         <div className="space-y-5 min-w-0">
           {/* Device Card Header + Direct Upload to This Disk Button */}
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-100">
             <div className="flex items-center gap-3 min-w-0">
-              <div className="w-10 h-10 rounded-xl bg-blue-50 text-blue-600 flex items-center justify-center shrink-0">
+              <div
+                className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${
+                  endpoint === 'host'
+                    ? 'bg-blue-50 text-blue-600'
+                    : 'bg-emerald-50 text-emerald-600'
+                }`}
+              >
                 <DeviceIcon className="w-5 h-5" aria-hidden="true" />
               </div>
               <div className="min-w-0">
-                <h3 className="text-base font-bold text-slate-900">{title}</h3>
-                <p className="text-xs text-slate-500 truncate">{deviceSubtitle}</p>
+                <div className="flex flex-wrap items-center gap-2">
+                  <h3 className="text-base font-bold text-slate-900">{title}</h3>
+                  <span
+                    className={`px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded-md ${
+                      endpoint === 'host'
+                        ? 'bg-blue-50 text-blue-700 border border-blue-200/60'
+                        : 'bg-emerald-50 text-emerald-700 border border-emerald-200/60'
+                    }`}
+                  >
+                    {endpoint === 'host' ? 'Host Disk Only' : 'Receiver Disk Only'}
+                  </span>
+                  {isMyOwnEndpoint && (
+                    <span className="px-2 py-0.5 text-[10px] font-semibold rounded-md bg-slate-100 text-slate-700">
+                      This Device
+                    </span>
+                  )}
+                </div>
+                <p className="text-xs text-slate-500 truncate mt-0.5">{deviceSubtitle}</p>
               </div>
             </div>
 
@@ -269,7 +342,11 @@ export const DualFolderExplorer: React.FC<DualFolderExplorerProps> = ({
               <button
                 type="button"
                 onClick={() => pickerRef.current?.click()}
-                className="inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl transition-colors w-full sm:w-auto cursor-pointer"
+                className={`inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold text-white rounded-xl transition-colors w-full sm:w-auto cursor-pointer ${
+                  endpoint === 'host'
+                    ? 'bg-blue-600 hover:bg-blue-700'
+                    : 'bg-emerald-600 hover:bg-emerald-700'
+                }`}
               >
                 <Upload className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
                 <span>Save Files to {endpoint === 'host' ? 'Host' : 'Receiver'} Disk</span>
@@ -292,19 +369,32 @@ export const DualFolderExplorer: React.FC<DualFolderExplorerProps> = ({
             </div>
           </div>
 
-          {/* Direct Physical Disk Drive Selector & Custom Disk Path Mount */}
+          {/* Endpoint-Specific Disk Drive Selector: Host shows ONLY Host OS Drives; Receiver shows ONLY Receiver Disk Controls */}
           <div className="bg-slate-50/90 border border-slate-200/80 rounded-xl p-3 sm:p-3.5 space-y-3 min-w-0">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1.5 min-w-0">
               <div className="flex flex-wrap items-center gap-1.5 min-w-0">
-                <HardDrive className="w-4 h-4 text-blue-600 shrink-0" aria-hidden="true" />
+                <HardDrive
+                  className={`w-4 h-4 shrink-0 ${
+                    endpoint === 'host' ? 'text-blue-600' : 'text-emerald-600'
+                  }`}
+                  aria-hidden="true"
+                />
                 <span className="text-xs font-semibold text-slate-700 shrink-0">
-                  Mounted Disk Drive:
+                  {endpoint === 'host' ? 'Mounted Host Disk:' : 'Mounted Receiver Disk:'}
                 </span>
                 <code
                   title={activeDiskRoot}
-                  className="text-xs font-mono font-semibold text-blue-700 bg-blue-50 px-2 py-0.5 rounded-md break-all"
+                  className={`text-xs font-mono font-semibold px-2 py-0.5 rounded-md break-all ${
+                    endpoint === 'host'
+                      ? 'text-blue-700 bg-blue-50'
+                      : 'text-emerald-700 bg-emerald-50'
+                  }`}
                 >
-                  {activeDiskRoot}
+                  {endpoint === 'host'
+                    ? activeDiskRoot
+                    : activePairedPeer?.receiverDiskLabel ||
+                      nodeInfo?.receiverDiskLabel ||
+                      activeDiskRoot}
                 </code>
               </div>
               <span className="text-[11px] font-mono text-slate-500 shrink-0">
@@ -312,58 +402,119 @@ export const DualFolderExplorer: React.FC<DualFolderExplorerProps> = ({
               </span>
             </div>
 
-            {/* 1-Click Detected OS Drives & System Folders */}
-            {availableDrives.length > 0 && (
-              <div className="flex flex-wrap items-center gap-1.5">
-                <span className="text-[11px] font-medium text-slate-500 mr-1">
-                  Quick Disk Access:
-                </span>
-                {availableDrives.map((drv) => {
-                  const isActiveDrive = activeDiskRoot === drv.path;
-                  return (
-                    <button
-                      key={`${endpoint}-${drv.id}`}
-                      type="button"
-                      onClick={() => handleMountDrive(endpoint, drv.path)}
-                      className={`px-2.5 py-1 text-[11px] font-medium rounded-lg border transition-colors cursor-pointer ${
-                        isActiveDrive
-                          ? 'bg-blue-600 text-white border-blue-600 font-semibold'
-                          : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-100'
-                      }`}
-                    >
-                      {drv.label}
-                    </button>
-                  );
-                })}
+            {endpoint === 'host' ? (
+              <>
+                {/* 1-Click Host-Only OS Drives & System Folders */}
+                {hostOnlyAvailableDrives.length > 0 && (
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-[11px] font-medium text-slate-500 mr-1">
+                      Host Disk Drives:
+                    </span>
+                    {hostOnlyAvailableDrives.map((drv) => {
+                      const isActiveDrive = activeDiskRoot === drv.path;
+                      return (
+                        <button
+                          key={`host-${drv.id}`}
+                          type="button"
+                          onClick={() => handleMountDrive('host', drv.path)}
+                          className={`px-2.5 py-1 text-[11px] font-medium rounded-lg border transition-colors cursor-pointer ${
+                            isActiveDrive
+                              ? 'bg-blue-600 text-white border-blue-600 font-semibold'
+                              : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-100'
+                          }`}
+                        >
+                          {drv.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* Custom Host Physical Disk Drive Path Input */}
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    handleMountDrive('host', diskInput);
+                  }}
+                  className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2"
+                >
+                  <label htmlFor="disk-path-host" className="sr-only">
+                    Custom Host Disk Drive Path
+                  </label>
+                  <input
+                    id="disk-path-host"
+                    type="text"
+                    value={diskInput}
+                    onChange={(e) => setDiskInput(e.target.value)}
+                    placeholder="Enter Host disk path (e.g. C:\Users\akash\Downloads or D:\)..."
+                    className="flex-1 min-w-0 text-xs font-mono bg-white border border-slate-200 rounded-lg px-3 py-2 sm:py-1.5 text-slate-900 placeholder:text-slate-400 focus-visible:outline-2 focus-visible:outline-blue-600"
+                  />
+                  <button
+                    type="submit"
+                    className="px-3 py-2 sm:py-1.5 text-xs font-semibold text-slate-700 bg-white hover:bg-slate-100 border border-slate-200 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    Mount Host Disk
+                  </button>
+                </form>
+              </>
+            ) : (
+              /* Receiver Disk Only Controls — Never shows Host OS drives! */
+              <div className="space-y-2.5">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-white border border-emerald-200/70 rounded-lg p-2.5">
+                  <div className="text-xs text-slate-600">
+                    <strong className="text-slate-900">
+                      {activePairedPeer ? `${activePairedPeer.name}'s` : 'Receiver'} Dedicated Disk:
+                    </strong>{' '}
+                    Isolated to the connected Receiver user ({activePairedPeer?.ipAddress || 'Network IP'}).
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => receiverDirectoryPickerRef.current?.click()}
+                    className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200/80 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <FolderInput className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                    <span>Load Receiver Device Folder</span>
+                  </button>
+                  <input
+                    ref={receiverDirectoryPickerRef}
+                    type="file"
+                    multiple
+                    tabIndex={-1}
+                    aria-hidden="true"
+                    {...({ webkitdirectory: '', directory: '' } as React.InputHTMLAttributes<HTMLInputElement>)}
+                    onChange={handleReceiverFolderSelection}
+                    className="hidden"
+                  />
+                </div>
+
+                {/* Custom Receiver Disk Path Mount */}
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    handleMountDrive('receiver', diskInput);
+                  }}
+                  className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2"
+                >
+                  <label htmlFor="disk-path-receiver" className="sr-only">
+                    Custom Receiver Disk Drive Path
+                  </label>
+                  <input
+                    id="disk-path-receiver"
+                    type="text"
+                    value={diskInput}
+                    onChange={(e) => setDiskInput(e.target.value)}
+                    placeholder="Enter Receiver disk folder path..."
+                    className="flex-1 min-w-0 text-xs font-mono bg-white border border-slate-200 rounded-lg px-3 py-2 sm:py-1.5 text-slate-900 placeholder:text-slate-400 focus-visible:outline-2 focus-visible:outline-emerald-600"
+                  />
+                  <button
+                    type="submit"
+                    className="px-3 py-2 sm:py-1.5 text-xs font-semibold text-slate-700 bg-white hover:bg-slate-100 border border-slate-200 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    Mount Receiver Disk
+                  </button>
+                </form>
               </div>
             )}
-
-            {/* Custom Physical Disk Drive Path Input */}
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                handleMountDrive(endpoint, diskInput);
-              }}
-              className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2"
-            >
-              <label htmlFor={`disk-path-${endpoint}`} className="sr-only">
-                Custom Disk Drive Path for {title}
-              </label>
-              <input
-                id={`disk-path-${endpoint}`}
-                type="text"
-                value={diskInput}
-                onChange={(e) => setDiskInput(e.target.value)}
-                placeholder="Enter direct disk path (e.g. C:\Users\akash\Downloads or D:\)..."
-                className="flex-1 min-w-0 text-xs font-mono bg-white border border-slate-200 rounded-lg px-3 py-2 sm:py-1.5 text-slate-900 placeholder:text-slate-400 focus-visible:outline-2 focus-visible:outline-blue-600"
-              />
-              <button
-                type="submit"
-                className="px-3 py-2 sm:py-1.5 text-xs font-semibold text-slate-700 bg-white hover:bg-slate-100 border border-slate-200 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-              >
-                Mount Disk
-              </button>
-            </form>
           </div>
 
           {/* Simple 1-Row New Folder Creator on Mounted Disk */}
@@ -389,7 +540,11 @@ export const DualFolderExplorer: React.FC<DualFolderExplorerProps> = ({
               />
               <button
                 type="submit"
-                className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 rounded-xl transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                className={`inline-flex items-center justify-center gap-1.5 px-3.5 py-2 text-xs font-semibold rounded-xl transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                  endpoint === 'host'
+                    ? 'text-blue-700 bg-blue-50 hover:bg-blue-100'
+                    : 'text-emerald-700 bg-emerald-50 hover:bg-emerald-100'
+                }`}
               >
                 <FolderPlus className="w-4 h-4 shrink-0" aria-hidden="true" />
                 <span>Create on {endpoint === 'host' ? 'Host' : 'Receiver'}</span>
@@ -407,11 +562,11 @@ export const DualFolderExplorer: React.FC<DualFolderExplorerProps> = ({
             )}
           </form>
 
-          {/* Visual Folder Grid (Browse Any Subfolder on Mounted Disk Drive) */}
+          {/* Visual Folder Grid (Browse Any Subfolder on This Endpoint's Disk) */}
           <div className="space-y-2">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <span className="text-xs font-semibold text-slate-700">
-                Disk Folders ({visibleFolders.length})
+                {endpoint === 'host' ? 'Host Disk Folders' : 'Receiver Disk Folders'} ({visibleFolders.length})
               </span>
               {selectedPath !== '/' ? (
                 <button
@@ -437,19 +592,30 @@ export const DualFolderExplorer: React.FC<DualFolderExplorerProps> = ({
                     aria-label={`Select ${endpoint} folder ${folder.path}`}
                     className={`flex flex-col justify-between p-3 rounded-xl border text-left transition-all cursor-pointer ${
                       isSelected
-                        ? 'bg-blue-50/80 border-blue-300 text-blue-950 shadow-2xs'
+                        ? endpoint === 'host'
+                          ? 'bg-blue-50/80 border-blue-300 text-blue-950 shadow-2xs'
+                          : 'bg-emerald-50/80 border-emerald-300 text-emerald-950 shadow-2xs'
                         : 'bg-slate-50/60 border-slate-200/80 text-slate-700 hover:bg-slate-100/70'
                     }`}
                   >
                     <div className="flex items-center justify-between w-full mb-2">
                       <Folder
                         className={`w-5 h-5 ${
-                          isSelected ? 'text-blue-600 fill-blue-600/15' : 'text-slate-400'
+                          isSelected
+                            ? endpoint === 'host'
+                              ? 'text-blue-600 fill-blue-600/15'
+                              : 'text-emerald-600 fill-emerald-600/15'
+                            : 'text-slate-400'
                         }`}
                         aria-hidden="true"
                       />
                       {isSelected && (
-                        <Check className="w-3.5 h-3.5 text-blue-600" aria-label="Selected target" />
+                        <Check
+                          className={`w-3.5 h-3.5 ${
+                            endpoint === 'host' ? 'text-blue-600' : 'text-emerald-600'
+                          }`}
+                          aria-label="Selected target"
+                        />
                       )}
                     </div>
                     <div className="min-w-0 w-full">
@@ -464,11 +630,12 @@ export const DualFolderExplorer: React.FC<DualFolderExplorerProps> = ({
             </div>
           </div>
 
-          {/* Files Inside Selected Disk Folder (Fetch/Save or Send to Other Device) */}
+          {/* Files Inside Selected Disk Folder (Strictly Host Files in Host Pane, Receiver Files in Receiver Pane) */}
           <div className="space-y-2">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <span className="text-xs font-semibold text-slate-700">
-                Files on Disk in <code className="font-mono text-slate-900 break-all">{selectedPath}</code>
+                {endpoint === 'host' ? 'Host Disk Files' : 'Receiver Disk Files'} in{' '}
+                <code className="font-mono text-slate-900 break-all">{selectedPath}</code>
               </span>
               <span className="text-xs font-mono tabular-nums text-slate-400">
                 {filesInFolder.length} {filesInFolder.length === 1 ? 'file' : 'files'}
@@ -478,9 +645,11 @@ export const DualFolderExplorer: React.FC<DualFolderExplorerProps> = ({
             {filesInFolder.length === 0 ? (
               <div className="py-6 px-4 text-center border border-dashed border-slate-200 rounded-xl bg-slate-50/40">
                 <p className="text-xs text-slate-500">
-                  No files in <code className="font-mono">{selectedPath}</code> on this disk. Click{' '}
+                  No files in <code className="font-mono">{selectedPath}</code> on{' '}
+                  <strong>{endpoint === 'host' ? 'Host Disk' : 'Receiver Disk'}</strong>. Click{' '}
                   <strong>Save Files to {endpoint === 'host' ? 'Host' : 'Receiver'} Disk</strong>{' '}
-                  or switch disk folders above to fetch existing files.
+                  {endpoint === 'receiver' ? 'or Load Receiver Device Folder ' : ''}
+                  to add or fetch files.
                 </p>
               </div>
             ) : (
@@ -519,7 +688,7 @@ export const DualFolderExplorer: React.FC<DualFolderExplorerProps> = ({
                           className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 rounded-lg transition-colors cursor-pointer"
                         >
                           <ArrowRightLeft className="w-3.5 h-3.5" aria-hidden="true" />
-                          <span>To {otherEndpointLabel}</span>
+                          <span>To {endpoint === 'host' ? 'Receiver' : 'Host'}</span>
                         </button>
                         <button
                           type="button"
@@ -556,38 +725,101 @@ export const DualFolderExplorer: React.FC<DualFolderExplorerProps> = ({
     ? `${nodeInfo.lanAddresses[0]}:${nodeInfo.port}`
     : window.location.host;
 
+  const receiverTitle = activePairedPeer
+    ? `${activePairedPeer.name} (Receiver Disk)`
+    : 'Receiver Device Disk';
+  const receiverSubtitle = activePairedPeer
+    ? `${activePairedPeer.platform} · Joined via IP (${activePairedPeer.ipAddress})`
+    : `${clientPlatform} · Isolated Receiver Storage`;
+
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-stretch">
-      {renderEndpointPane(
-        'host',
-        'Host Device Disk',
-        `Local Wi-Fi (${hostAddress})`,
-        nodeInfo?.hostDiskRoot || './storage/host',
-        hostFolders,
-        selectedHostFolder,
-        hostFolderInput,
-        setHostFolderInput,
-        hostDiskInput,
-        setHostDiskInput,
-        hostError,
-        hostSuccess,
-        hostFilePickerRef
-      )}
-      {renderEndpointPane(
-        'receiver',
-        'Receiver Device Disk',
-        clientPlatform,
-        nodeInfo?.receiverDiskRoot || './storage/receiver',
-        receiverFolders,
-        selectedReceiverFolder,
-        receiverFolderInput,
-        setReceiverFolderInput,
-        receiverDiskInput,
-        setReceiverDiskInput,
-        receiverError,
-        receiverSuccess,
-        receiverFilePickerRef
-      )}
+    <div className="space-y-4">
+      {/* Disk Section Filter Bar: Both Disks vs Host Disk Only vs Receiver Disk Only */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-white border border-slate-200/80 rounded-xl p-2.5 px-3.5 shadow-2xs">
+        <span className="text-xs font-semibold text-slate-600">
+          Disk View Mode (Host Disk shows only Host data · Receiver Disk shows only Receiver data):
+        </span>
+        <div
+          role="group"
+          aria-label="Disk Section View Filter"
+          className="inline-flex flex-wrap items-center bg-slate-100 p-1 rounded-lg gap-1"
+        >
+          <button
+            type="button"
+            onClick={() => setDiskViewFilter('both')}
+            className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
+              diskViewFilter === 'both'
+                ? 'bg-white text-slate-900 shadow-2xs'
+                : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            Both Disks ({hostDiskData.endpointFiles.length + receiverDiskData.endpointFiles.length})
+          </button>
+          <button
+            type="button"
+            onClick={() => setDiskViewFilter('host')}
+            className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
+              diskViewFilter === 'host'
+                ? 'bg-white text-blue-600 shadow-2xs'
+                : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            Host Disk Only ({hostDiskData.endpointFiles.length})
+          </button>
+          <button
+            type="button"
+            onClick={() => setDiskViewFilter('receiver')}
+            className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
+              diskViewFilter === 'receiver'
+                ? 'bg-white text-emerald-600 shadow-2xs'
+                : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            Receiver Disk Only ({receiverDiskData.endpointFiles.length})
+          </button>
+        </div>
+      </div>
+
+      <div
+        className={`grid grid-cols-1 ${
+          diskViewFilter === 'both' ? 'lg:grid-cols-2' : ''
+        } gap-6 items-stretch`}
+      >
+        {(diskViewFilter === 'both' || diskViewFilter === 'host') &&
+          renderEndpointPane(
+            'host',
+            'Host Device Disk',
+            `Host Workstation (${hostAddress})`,
+            nodeInfo?.hostDiskRoot || './storage/host',
+            hostDiskData.endpointFolders,
+            hostDiskData.endpointFiles,
+            selectedHostFolder,
+            hostFolderInput,
+            setHostFolderInput,
+            hostDiskInput,
+            setHostDiskInput,
+            hostError,
+            hostSuccess,
+            hostFilePickerRef
+          )}
+        {(diskViewFilter === 'both' || diskViewFilter === 'receiver') &&
+          renderEndpointPane(
+            'receiver',
+            receiverTitle,
+            receiverSubtitle,
+            nodeInfo?.receiverDiskRoot || './storage/receiver',
+            receiverDiskData.endpointFolders,
+            receiverDiskData.endpointFiles,
+            selectedReceiverFolder,
+            receiverFolderInput,
+            setReceiverFolderInput,
+            receiverDiskInput,
+            setReceiverDiskInput,
+            receiverError,
+            receiverSuccess,
+            receiverFilePickerRef
+          )}
+      </div>
     </div>
   );
 };

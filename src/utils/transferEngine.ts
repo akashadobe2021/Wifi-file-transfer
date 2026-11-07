@@ -422,6 +422,58 @@ export interface DiskDrivePreset {
   kind: 'drive' | 'system' | 'app';
 }
 
+export interface LobbyPeer {
+  peerId: string;
+  name: string;
+  ipAddress: string;
+  platform: string;
+  role: EndpointRole;
+  joinedAt: string;
+  lastSeenMs: number;
+  connected: boolean;
+  receiverDiskLabel: string;
+  receiverDiskPath: string;
+  receiverFileCount: number;
+}
+
+export function normalizeClientIp(rawIp: string): string {
+  const trimmed = (rawIp || '').trim();
+  if (!trimmed) return '127.0.0.1';
+  const firstForwarded = trimmed.split(',')[0].trim();
+  if (firstForwarded === '::1' || firstForwarded === '0:0:0:0:0:0:0:1') {
+    return '127.0.0.1';
+  }
+  if (firstForwarded.startsWith('::ffff:')) {
+    return firstForwarded.slice(7);
+  }
+  return firstForwarded;
+}
+
+export function sanitizePeerId(rawId: string): string {
+  const cleaned = (rawId || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]/g, '')
+    .slice(0, 48);
+  return cleaned || 'default-receiver';
+}
+
+export function filterEndpointDiskData(
+  folders: FolderNode[],
+  files: TransferredFileRecord[],
+  endpoint: EndpointRole
+): { endpointFolders: FolderNode[]; endpointFiles: TransferredFileRecord[] } {
+  return {
+    endpointFolders: folders.filter((f) => f.endpoint === endpoint),
+    endpointFiles: files.filter((f) => f.targetEndpoint === endpoint),
+  };
+}
+
+export function getJoinedReceiverPeers(peers: LobbyPeer[]): LobbyPeer[] {
+  return peers
+    .filter((p) => p.role === 'receiver' && p.connected)
+    .sort((a, b) => b.lastSeenMs - a.lastSeenMs);
+}
+
 export function getParentVirtualPath(virtualPath: string): string {
   const cleaned = virtualPath.trim().replace(/\\/g, '/').replace(/\/+$/, '');
   if (!cleaned || cleaned === '/') return '/';
@@ -452,5 +504,3 @@ export function validateDiskMountInput(rawDiskPath: string): {
   }
   return { valid: true, trimmed };
 }
-
-

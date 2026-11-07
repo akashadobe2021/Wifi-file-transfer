@@ -16,7 +16,14 @@ import {
   getParentVirtualPath,
   validateDiskMountInput,
   computeDeterministicChecksum,
+  normalizeClientIp,
+  sanitizePeerId,
+  filterEndpointDiskData,
+  getJoinedReceiverPeers,
   type TransferJob,
+  type FolderNode,
+  type TransferredFileRecord,
+  type LobbyPeer,
 } from './transferEngine';
 
 function createMockJob(id: string, fileSizeBytes: number, chunkSizeBytes = 65536): TransferJob {
@@ -144,5 +151,87 @@ test('getParentVirtualPath and validateDiskMountInput support direct disk drive 
   assert.equal(validateDiskMountInput('   ').valid, false);
 });
 
+test('normalizeClientIp, sanitizePeerId, getJoinedReceiverPeers, and filterEndpointDiskData strictly isolate Host and Receiver', () => {
+  assert.equal(normalizeClientIp('::ffff:192.168.1.55'), '192.168.1.55');
+  assert.equal(normalizeClientIp('::1'), '127.0.0.1');
+  assert.equal(sanitizePeerId('peer-123/../bad'), 'peer-123bad');
 
+  const folders: FolderNode[] = [
+    { id: '1', endpoint: 'host', name: 'HostRoot', path: '/', parentPath: '/', createdAt: '00:00:00', fileCount: 1 },
+    { id: '2', endpoint: 'receiver', name: 'RecRoot', path: '/', parentPath: '/', createdAt: '00:00:00', fileCount: 1 },
+  ];
+  const files: TransferredFileRecord[] = [
+    {
+      id: 'f1',
+      name: 'host-only.txt',
+      sizeBytes: 100,
+      mimeType: 'text/plain',
+      sourceEndpoint: 'receiver',
+      targetEndpoint: 'host',
+      targetFolderPath: '/',
+      chunkSizeBytes: 65536,
+      totalPieces: 1,
+      checksum: 'sha256:1111',
+      completedAt: '00:00:00',
+    },
+    {
+      id: 'f2',
+      name: 'receiver-only.txt',
+      sizeBytes: 200,
+      mimeType: 'text/plain',
+      sourceEndpoint: 'host',
+      targetEndpoint: 'receiver',
+      targetFolderPath: '/',
+      chunkSizeBytes: 65536,
+      totalPieces: 1,
+      checksum: 'sha256:2222',
+      completedAt: '00:00:00',
+    },
+  ];
 
+  const hostOnly = filterEndpointDiskData(folders, files, 'host');
+  assert.equal(hostOnly.endpointFolders.length, 1);
+  assert.equal(hostOnly.endpointFolders[0].name, 'HostRoot');
+  assert.equal(hostOnly.endpointFiles.length, 1);
+  assert.equal(hostOnly.endpointFiles[0].name, 'host-only.txt');
+
+  const receiverOnly = filterEndpointDiskData(folders, files, 'receiver');
+  assert.equal(receiverOnly.endpointFolders.length, 1);
+  assert.equal(receiverOnly.endpointFolders[0].name, 'RecRoot');
+  assert.equal(receiverOnly.endpointFiles.length, 1);
+  assert.equal(receiverOnly.endpointFiles[0].name, 'receiver-only.txt');
+
+  const peers: LobbyPeer[] = [
+    {
+      peerId: 'host-1',
+      name: 'Host Workstation',
+      ipAddress: '127.0.0.1',
+      platform: 'Windows Device',
+      role: 'host',
+      joinedAt: '10:00:00',
+      lastSeenMs: 100,
+      connected: true,
+      receiverDiskLabel: '',
+      receiverDiskPath: '',
+      receiverFileCount: 0,
+    },
+    {
+      peerId: 'rec-1',
+      name: 'Akash Phone',
+      ipAddress: '192.168.1.42',
+      platform: 'Android Device',
+      role: 'receiver',
+      joinedAt: '10:01:00',
+      lastSeenMs: 300,
+      connected: true,
+      receiverDiskLabel: 'Phone Storage (Downloads)',
+      receiverDiskPath: '/Downloads',
+      receiverFileCount: 2,
+    },
+  ];
+
+  const joined = getJoinedReceiverPeers(peers);
+  assert.equal(joined.length, 1);
+  assert.equal(joined[0].peerId, 'rec-1');
+  assert.equal(joined[0].name, 'Akash Phone');
+});
