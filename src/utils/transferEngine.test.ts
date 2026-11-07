@@ -13,6 +13,8 @@ import {
   validateNetworkAddress,
   formatNetworkAccessUrl,
   rankLanIpv4Address,
+  getParentVirtualPath,
+  validateDiskMountInput,
   computeDeterministicChecksum,
   type TransferJob,
 } from './transferEngine';
@@ -130,5 +132,17 @@ test('validateNetworkAddress, formatNetworkAccessUrl, and rankLanIpv4Address han
   assert.ok(rankLanIpv4Address('192.168.1.10') < rankLanIpv4Address('169.254.8.1'));
   assert.ok(rankLanIpv4Address('10.0.0.5') < rankLanIpv4Address('169.254.8.1'));
 });
+
+test('getParentVirtualPath and validateDiskMountInput support direct disk drive navigation and mounting', () => {
+  assert.equal(getParentVirtualPath('/'), '/');
+  assert.equal(getParentVirtualPath('/Users'), '/');
+  assert.equal(getParentVirtualPath('/Users/akash/Downloads'), '/Users/akash');
+
+  assert.equal(validateDiskMountInput('C:\\Users\\akash\\Downloads').valid, true);
+  assert.equal(validateDiskMountInput('D:\\').valid, true);
+  assert.equal(validateDiskMountInput('/tmp').valid, true);
+  assert.equal(validateDiskMountInput('   ').valid, false);
+});
+
 
 

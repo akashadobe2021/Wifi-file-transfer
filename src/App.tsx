@@ -114,11 +114,83 @@ export default function App() {
     };
   }, []);
 
-  const handleSelectFolder = (endpoint: EndpointRole, path: string) => {
+  const handleSelectFolder = async (endpoint: EndpointRole, folderPath: string) => {
     if (endpoint === 'host') {
-      setSelectedHostFolder(path);
+      setSelectedHostFolder(folderPath);
     } else {
-      setSelectedReceiverFolder(path);
+      setSelectedReceiverFolder(folderPath);
+    }
+
+    try {
+      const res = await fetch('/api/storage/navigate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ endpoint, folderPath }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        applyServerState(data.state);
+      }
+    } catch {
+      // Ignore transient navigation error
+    }
+  };
+
+  const handleMountDiskPath = async (
+    endpoint: EndpointRole,
+    diskPath: string
+  ): Promise<{ ok: boolean; error?: string; diskRoot?: string }> => {
+    try {
+      const res = await fetch('/api/storage/mount', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ endpoint, diskPath }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        return { ok: false, error: data.error || 'Failed to mount disk drive.' };
+      }
+      applyServerState(data.state);
+      if (endpoint === 'host') {
+        setSelectedHostFolder('/');
+      } else {
+        setSelectedReceiverFolder('/');
+      }
+      return { ok: true, diskRoot: data.diskRoot };
+    } catch {
+      return { ok: false, error: 'Failed to reach local server.' };
+    }
+  };
+
+  const handleTransferDiskFile = async (
+    sourceEndpoint: EndpointRole,
+    sourceFolderPath: string,
+    fileName: string
+  ): Promise<{ ok: boolean; error?: string }> => {
+    const targetEndpoint: EndpointRole = sourceEndpoint === 'host' ? 'receiver' : 'host';
+    const targetFolderPath =
+      targetEndpoint === 'host' ? selectedHostFolder : selectedReceiverFolder;
+
+    try {
+      const res = await fetch('/api/files/transfer-disk', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sourceEndpoint,
+          sourceFolderPath,
+          fileName,
+          targetEndpoint,
+          targetFolderPath,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        return { ok: false, error: data.error || 'Could not transfer disk file.' };
+      }
+      applyServerState(data.state);
+      return { ok: true };
+    } catch {
+      return { ok: false, error: 'Failed to reach local server.' };
     }
   };
 
@@ -308,7 +380,7 @@ export default function App() {
   const totalBytesTransferred = completedFiles.reduce((acc, f) => acc + f.sizeBytes, 0);
 
   return (
-    <div className="min-h-screen flex flex-col bg-[#f6f8fc] text-slate-900">
+    <div className="min-h-screen flex flex-col bg-[#f6f8fc] text-slate-900 overflow-x-hidden">
       <TopBar
         activeSection={activeSection}
         activeTransfersCount={activeStreamsCount}
@@ -319,9 +391,9 @@ export default function App() {
         }}
       />
 
-      <main className="flex-1 max-w-6xl w-full mx-auto px-6 py-7 space-y-6">
+      <main className="flex-1 max-w-6xl w-full mx-auto px-3.5 sm:px-6 py-5 sm:py-7 space-y-5 sm:space-y-6">
         {/* Simple Friendly Welcome & Status Header */}
-        <section className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+        <section className="flex flex-col md:flex-row md:items-center justify-between gap-3 sm:gap-4">
           <div>
             <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900">
               Easy Wi-Fi File Transfer
@@ -331,14 +403,14 @@ export default function App() {
             </p>
           </div>
 
-          <div className="flex flex-wrap items-center gap-3 text-xs text-slate-600 bg-white border border-slate-200/80 rounded-xl px-4 py-2.5 shadow-2xs">
-            <span>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-600 bg-white border border-slate-200/80 rounded-xl px-3.5 py-2.5 shadow-2xs">
+            <span className="break-all">
               Network IP:{' '}
               <strong className="font-mono text-blue-600">
                 {nodeInfo?.activeNetworkUrl || window.location.origin}
               </strong>
             </span>
-            <span aria-hidden="true">·</span>
+            <span className="hidden sm:inline" aria-hidden="true">·</span>
             <span>
               Saved Files: <strong className="font-mono text-slate-900">{completedFiles.length}</strong> ({formatByteSize(totalBytesTransferred)})
             </span>
@@ -375,10 +447,10 @@ export default function App() {
           <div className="space-y-3">
             <div>
               <h2 className="text-base font-bold text-slate-900">
-                Device Folders & Saved Files
+                Direct Host & Receiver Disk Drives
               </h2>
               <p className="text-xs text-slate-500">
-                Create folders on either your Host or Receiver device and click any folder to set where files are saved.
+                Mount any local disk drive or folder (e.g. C:\, D:\, Downloads, Desktop) on Host or Receiver to directly save and fetch files.
               </p>
             </div>
             <DualFolderExplorer
@@ -389,7 +461,17 @@ export default function App() {
               selectedHostFolder={selectedHostFolder}
               selectedReceiverFolder={selectedReceiverFolder}
               onSelectFolder={handleSelectFolder}
+              onMountDiskPath={handleMountDiskPath}
               onCreateFolder={handleCreateFolder}
+              onUploadFilesToEndpoint={(files, targetEndpoint, targetFolderPath) =>
+                handleUploadRealFiles(
+                  files,
+                  targetEndpoint === 'host' ? 'receiver' : 'host',
+                  targetEndpoint,
+                  targetFolderPath
+                )
+              }
+              onTransferDiskFile={handleTransferDiskFile}
               onDeleteFile={handleDeleteFile}
             />
           </div>

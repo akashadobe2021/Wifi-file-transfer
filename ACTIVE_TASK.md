@@ -1,30 +1,27 @@
 # 🚧 ACTIVE TASK CHECKPOINT
 
 **Problem:** 
-1. As shown in the user's screenshot (`/public/assets/aistudio/image_2a31f1db.png`), `server.ts` logged `PacketBridge LAN server running on http://0.0.0.0:3000`, and when the user opened `http://0.0.0.0:3000` in Chrome on Windows, Chrome failed with `ERR_ADDRESS_INVALID` because `0.0.0.0` is an all-interfaces bind address that Windows browsers reject as a destination URL.
-2. On Windows machines with virtual or disconnected adapters (`169.254.x.x`), `os.networkInterfaces()` may list link-local APIPA addresses before the real Wi-Fi/Hotspot `192.168.x.x` / `10.x.x.x` address unless interfaces are prioritized by RFC1918 LAN subnet rank.
-3. `vite.config.ts` triggered a Vite 8 warning on Windows for using `__dirname` instead of `fileURLToPath(import.meta.url)`.
+On mobile viewports (`375x812`), several UI elements are hidden, clipped, or overflowing horizontally (`scrollWidth: 385px > 375px`):
+1. `TopBar.tsx` places the brand logo, 4 navigation links, and the `Upload Files` button in a single row with `gap-8`, squeezing the navigation bar to `25px` wide (`Ho...`) and hiding `Transfers`, `Folders & Files`, and `History`.
+2. `TransferQueuePanel.tsx` header (`File Transfers` + `All / In Progress / Done` filter tabs) does not wrap, pushing `Done (0)` outside the mobile viewport (`right: 385px`). Destination switcher buttons and file rows also crowd on narrow screens.
+3. `DualFolderExplorer.tsx` file rows (filename + `To Receiver` + `Save to Disk` + `Delete` buttons), mounted disk path header, and folder/disk forms crowd on `375px` mobile screens.
+4. `NetworkAccessPanel.tsx` and `ActivityLogPanel.tsx` inputs and action button groups need touch-friendly mobile stacking.
 
 **Best Solution:** 
-1. **Prioritize Real Wi-Fi / Hotspot LAN IPs & Guard Against `0.0.0.0` (`src/utils/transferEngine.ts`)**:
-   - Add `rankLanIpv4Address(ip: string)` to sort `192.168.x.x`, `10.x.x.x`, and `172.16-31.x.x` ahead of `169.254.x.x` link-local addresses.
-   - Update `formatNetworkAccessUrl` so `0.0.0.0` is normalized to `localhost` (never producing `http://0.0.0.0:3000`), and update `validateNetworkAddress` to reject `0.0.0.0` with a clear explanation.
-2. **Clear Clickable Startup URLs in `server.ts`**:
-   - Sort detected interfaces using `rankLanIpv4Address`.
-   - Print clickable `http://localhost:3000` (for this PC) and each detected `http://<LAN-IP>:3000` (for Wi-Fi / Hotspot devices) in the terminal startup banner instead of `http://0.0.0.0:3000`.
-3. **Fix Vite 8 Config Loader Warning (`vite.config.ts`)**:
-   - Replace `__dirname` with `path.dirname(fileURLToPath(import.meta.url))` in `vite.config.ts`.
-4. **Update `NetworkAccessPanel.tsx`**:
-   - Clearly display both the **This PC (`http://localhost:3000`)** link and the **Wi-Fi / Hotspot Network IP (`http://<LAN-IP>:3000`)** link with 1-click switchers.
+1. **Responsive 2-Row Mobile Header (`src/components/TopBar.tsx`)**:
+   - On mobile (`< md`), render the brand wordmark and `Upload Files` button on the top row, and render all 4 navigation tabs (`Home`, `Transfers`, `Folders & Files`, `History`) in a full-width 4-item bar below it so every option is 100% visible without horizontal scrolling or clipping. On `md+` screens, keep the single-row 3-zone header.
+2. **Mobile-First Responsive Wrapping & Stacking (`TransferQueuePanel.tsx`, `DualFolderExplorer.tsx`, `NetworkAccessPanel.tsx`, `ActivityLogPanel.tsx`, `App.tsx`)**:
+   - Ensure `document.documentElement.scrollWidth <= document.documentElement.clientWidth` (`375px`) across all views.
+   - Stack file rows, folder/disk mount forms, destination toggles, and filter tabs cleanly on `< sm` viewports with touch-friendly button targets.
 
 **Goal:** 
-The terminal startup log and UI never output `http://0.0.0.0:3000`, real `192.168.x.x` / `10.x.x.x` Wi-Fi/Hotspot IPs are automatically prioritized first, `vite.config.ts` has zero warnings, and all tests and builds pass.
+Every navigation tab, button, folder control, disk mount input, and file action is 100% visible, non-overlapping, and zero-horizontal-overflow (`scrollWidth === 375`) on mobile (`375x812`) as well as desktop (`1440x900`).
 
 **Steps:**
-- [x] Step 1: Read `CODE_INDEX.md`, `ACTIVE_TASK.md`, `server.ts`, `vite.config.ts`, and `src/utils/transferEngine.ts`.
-- [x] Step 2: Update `src/utils/transferEngine.ts` and `src/utils/transferEngine.test.ts` with `rankLanIpv4Address` and `0.0.0.0` handling.
-- [x] Step 3: Update `server.ts`, `vite.config.ts`, and `src/components/NetworkAccessPanel.tsx`.
-- [x] Step 4: Run unit tests, `compile_applet`, and `lint_applet`, and update `CODE_INDEX.md` and `ACTIVE_TASK.md`.
+- [x] Step 1: Read `CODE_INDEX.md`, `ACTIVE_TASK.md`, and component files; inspect mobile `375x812` layout in Playwright to identify all overflowing/hidden elements.
+- [x] Step 2: Update `TopBar.tsx`, `NetworkAccessPanel.tsx`, `TransferQueuePanel.tsx`, `DualFolderExplorer.tsx`, `ActivityLogPanel.tsx`, and `App.tsx` for full mobile compatibility.
+- [x] Step 3: Compile, lint, restart dev server, and verify both `375x812` mobile and `1440x900` desktop viewports in Playwright (`scrollWidth === clientWidth`).
+- [x] Step 4: Update `CODE_INDEX.md` and `ACTIVE_TASK.md`.
 
 **Status:** 
 [Completed on 2026-11-06]

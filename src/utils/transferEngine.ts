@@ -415,4 +415,42 @@ export function validateNetworkAddress(
   };
 }
 
+export interface DiskDrivePreset {
+  id: string;
+  label: string;
+  path: string;
+  kind: 'drive' | 'system' | 'app';
+}
+
+export function getParentVirtualPath(virtualPath: string): string {
+  const cleaned = virtualPath.trim().replace(/\\/g, '/').replace(/\/+$/, '');
+  if (!cleaned || cleaned === '/') return '/';
+  const lastSlash = cleaned.lastIndexOf('/');
+  if (lastSlash <= 0) return '/';
+  return cleaned.slice(0, lastSlash);
+}
+
+export function validateDiskMountInput(rawDiskPath: string): {
+  valid: boolean;
+  trimmed: string;
+  error?: string;
+} {
+  const trimmed = rawDiskPath.trim();
+  if (!trimmed) {
+    return {
+      valid: false,
+      trimmed: '',
+      error: 'Please enter a valid disk drive or folder path (e.g. C:\\Users\\Public or D:\\).',
+    };
+  }
+  if (/[\0<>|?*]/.test(trimmed)) {
+    return {
+      valid: false,
+      trimmed: '',
+      error: 'Disk path contains invalid characters.',
+    };
+  }
+  return { valid: true, trimmed };
+}
+
 

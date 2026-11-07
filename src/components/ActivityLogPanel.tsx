@@ -67,7 +67,7 @@ export const ActivityLogPanel: React.FC<ActivityLogPanelProps> = ({ logs, onClea
   return (
     <section
       aria-label="Private Local Transfer Activity Log"
-      className="bg-white border border-slate-200/90 rounded-2xl p-6 shadow-2xs space-y-5"
+      className="bg-white border border-slate-200/90 rounded-2xl p-4 sm:p-6 shadow-2xs space-y-5 overflow-hidden"
     >
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-100">
         <div>
@@ -77,7 +77,7 @@ export const ActivityLogPanel: React.FC<ActivityLogPanelProps> = ({ logs, onClea
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
             onClick={handleExportCsv}
@@ -99,7 +99,7 @@ export const ActivityLogPanel: React.FC<ActivityLogPanelProps> = ({ logs, onClea
 
       {/* Filter & Search Row */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-        <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-xl overflow-x-auto">
+        <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-xl overflow-x-auto max-w-full">
           {(
             [
               { id: 'all', label: 'All Activity' },
@@ -122,7 +122,7 @@ export const ActivityLogPanel: React.FC<ActivityLogPanelProps> = ({ logs, onClea
           ))}
         </div>
 
-        <div className="relative min-w-60">
+        <div className="relative w-full sm:w-64">
           <label htmlFor="activity-log-search" className="sr-only">
             Search activity history
           </label>

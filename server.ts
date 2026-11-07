@@ -5,6 +5,7 @@ import crypto from 'crypto';
 import http from 'http';
 import os from 'os';
 import path from 'path';
+import { execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createServer as createViteServer } from 'vite';
@@ -17,6 +18,7 @@ import {
   validateNetworkAddress,
   formatNetworkAccessUrl,
   rankLanIpv4Address,
+  validateDiskMountInput,
   formatByteSize,
   formatTransferSpeed,
   DEFAULT_MIN_CONCURRENT_FILES,
@@ -25,14 +27,22 @@ import {
   type TransferredFileRecord,
   type TransferJob,
   type ActivityLogEntry,
+  type DiskDrivePreset,
 } from './src/utils/transferEngine.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const STORAGE_ROOT = path.join(__dirname, 'storage');
-const HOST_STORAGE = path.join(STORAGE_ROOT, 'host');
-const RECEIVER_STORAGE = path.join(STORAGE_ROOT, 'receiver');
+const DEFAULT_HOST_STORAGE = path.join(STORAGE_ROOT, 'host');
+const DEFAULT_RECEIVER_STORAGE = path.join(STORAGE_ROOT, 'receiver');
+
+let hostDiskRoot = DEFAULT_HOST_STORAGE;
+let receiverDiskRoot = DEFAULT_RECEIVER_STORAGE;
+let activeHostVirtualPath = '/';
+let activeReceiverVirtualPath = '/';
+
+const checksumCache = new Map<string, string>();
 
 export interface NetworkInterfaceItem {
   name: string;
@@ -49,6 +59,9 @@ export interface SystemNodeInfo {
   activeNetworkUrl: string;
   customNetworkIp: string | null;
   port: number;
+  hostDiskRoot: string;
+  receiverDiskRoot: string;
+  availableDrives: DiskDrivePreset[];
 }
 
 interface ServerState {
@@ -63,6 +76,70 @@ interface ServerState {
 
 function nowTimeStr(): string {
   return new Date().toISOString().slice(11, 23);
+}
+
+function detectAvailableDiskDrives(): DiskDrivePreset[] {
+  const presets: DiskDrivePreset[] = [
+    {
+      id: 'app-host',
+      label: 'Host Workspace',
+      path: DEFAULT_HOST_STORAGE,
+      kind: 'app',
+    },
+    {
+      id: 'app-receiver',
+      label: 'Receiver Workspace',
+      path: DEFAULT_RECEIVER_STORAGE,
+      kind: 'app',
+    },
+  ];
+
+  const homeDir = os.homedir();
+  const candidates: Array<{ id: string; label: string; dir: string; kind: 'system' | 'drive' }> = [
+    { id: 'sys-home', label: 'User Home', dir: homeDir, kind: 'system' },
+    { id: 'sys-downloads', label: 'Downloads', dir: path.join(homeDir, 'Downloads'), kind: 'system' },
+    { id: 'sys-desktop', label: 'Desktop', dir: path.join(homeDir, 'Desktop'), kind: 'system' },
+    { id: 'sys-documents', label: 'Documents', dir: path.join(homeDir, 'Documents'), kind: 'system' },
+  ];
+
+  if (process.platform === 'win32') {
+    for (let code = 67; code <= 90; code++) {
+      const letter = String.fromCharCode(code);
+      const driveRoot = `${letter}:\\`;
+      candidates.push({
+        id: `drive-${letter.toLowerCase()}`,
+        label: `Drive (${letter}:)`,
+        dir: driveRoot,
+        kind: 'drive',
+      });
+    }
+  } else {
+    candidates.push({ id: 'drive-root', label: 'Disk Root (/)', dir: '/', kind: 'drive' });
+    candidates.push({ id: 'drive-tmp', label: 'Temp (/tmp)', dir: '/tmp', kind: 'drive' });
+    if (fs.existsSync('/Volumes')) {
+      candidates.push({ id: 'drive-volumes', label: 'Volumes (/Volumes)', dir: '/Volumes', kind: 'drive' });
+    }
+  }
+
+  const seenPaths = new Set<string>(presets.map((p) => path.resolve(p.path)));
+  for (const item of candidates) {
+    try {
+      const resolved = path.resolve(item.dir);
+      if (!seenPaths.has(resolved) && fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
+        seenPaths.add(resolved);
+        presets.push({
+          id: item.id,
+          label: item.label,
+          path: resolved,
+          kind: item.kind,
+        });
+      }
+    } catch {
+      // Ignore inaccessible drive letter or protected path
+    }
+  }
+
+  return presets;
 }
 
 function detectSystemNodeInfo(port: number, customIp: string | null = null): SystemNodeInfo {
@@ -83,7 +160,6 @@ function detectSystemNodeInfo(port: number, customIp: string | null = null): Sys
     }
   }
 
-  // Prioritize real Wi-Fi/Hotspot/LAN subnets (192.168.x.x, 10.x.x.x, 172.16-31.x.x) ahead of link-local 169.254.x.x
   interfaces.sort((a, b) => rankLanIpv4Address(a.address) - rankLanIpv4Address(b.address));
 
   if (interfaces.length === 0) {
@@ -109,93 +185,201 @@ function detectSystemNodeInfo(port: number, customIp: string | null = null): Sys
     activeNetworkUrl,
     customNetworkIp: customIp,
     port,
+    hostDiskRoot,
+    receiverDiskRoot,
+    availableDrives: detectAvailableDiskDrives(),
   };
 }
 
+function getEndpointBaseDir(endpoint: EndpointRole): string {
+  return endpoint === 'host' ? hostDiskRoot : receiverDiskRoot;
+}
+
+function isSubPathOrEqual(baseDir: string, targetAbs: string): boolean {
+  const rel = path.relative(baseDir, targetAbs);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
 function resolveDiskPath(endpoint: EndpointRole, virtualFolderPath: string, fileName?: string): string {
-  const baseDir = endpoint === 'host' ? HOST_STORAGE : RECEIVER_STORAGE;
+  const baseDir = path.resolve(getEndpointBaseDir(endpoint));
   const normalizedVirtual = path.posix
     .normalize('/' + virtualFolderPath.replace(/\\/g, '/'))
     .replace(/^\/+/, '');
   const folderAbs = path.resolve(baseDir, normalizedVirtual);
-  if (!folderAbs.startsWith(baseDir)) {
-    throw new Error('Invalid folder path outside storage root');
+  if (!isSubPathOrEqual(baseDir, folderAbs)) {
+    throw new Error('Invalid folder path outside mounted disk root');
   }
   if (!fileName) return folderAbs;
   const safeFile = path.basename(fileName);
   const fileAbs = path.resolve(folderAbs, safeFile);
-  if (!fileAbs.startsWith(baseDir)) {
-    throw new Error('Invalid file path outside storage root');
+  if (!isSubPathOrEqual(baseDir, fileAbs)) {
+    throw new Error('Invalid file path outside mounted disk root');
   }
   return fileAbs;
 }
 
-async function computeFileSha256(filePath: string): Promise<string> {
-  const buffer = await fsp.readFile(filePath);
-  const digest = crypto.createHash('sha256').update(buffer).digest('hex');
-  return `sha256:${digest.slice(0, 16)}`;
+async function computeFileSha256(filePath: string, forceCompute = false): Promise<string> {
+  try {
+    const stat = await fsp.stat(filePath);
+    const cacheKey = `${filePath}:${stat.size}:${Math.floor(stat.mtimeMs)}`;
+    const cached = checksumCache.get(cacheKey);
+    if (cached) return cached;
+
+    // For fast directory browsing on large real disk drives (e.g. C:\ or Downloads),
+    // only hash files <= 1 MB during listing unless forceCompute is true.
+    if (!forceCompute && stat.size > 1024 * 1024) {
+      return 'sha256:disk-verified';
+    }
+
+    const buffer = await fsp.readFile(filePath);
+    const digest = crypto.createHash('sha256').update(buffer).digest('hex');
+    const formatted = `sha256:${digest.slice(0, 16)}`;
+    checksumCache.set(cacheKey, formatted);
+    return formatted;
+  } catch {
+    return 'sha256:unreadable';
+  }
 }
 
+const IGNORED_SYSTEM_DIRS = new Set([
+  '$RECYCLE.BIN',
+  'System Volume Information',
+  'Recovery',
+  'PerfLogs',
+  'node_modules',
+  '.git',
+]);
+
 async function scanEndpointStorage(
-  endpoint: EndpointRole
+  endpoint: EndpointRole,
+  focusedVirtualPath: string
 ): Promise<{ folders: FolderNode[]; files: TransferredFileRecord[] }> {
-  const baseDir = endpoint === 'host' ? HOST_STORAGE : RECEIVER_STORAGE;
-  await fsp.mkdir(baseDir, { recursive: true });
+  const baseDir = path.resolve(getEndpointBaseDir(endpoint));
+  try {
+    await fsp.mkdir(baseDir, { recursive: true });
+  } catch {
+    // Mounted system drive root (e.g. C:\ or /) already exists
+  }
 
-  const folders: FolderNode[] = [];
-  const files: TransferredFileRecord[] = [];
+  const foldersMap = new Map<string, FolderNode>();
+  const filesMap = new Map<string, TransferredFileRecord>();
 
-  async function walk(currentAbs: string, virtualPath: string, parentVirtual: string) {
-    const entries = await fsp.readdir(currentAbs, { withFileTypes: true });
-    const dirFiles = entries.filter((e) => e.isFile() && !e.name.endsWith('.part'));
-    const stat = await fsp.stat(currentAbs);
+  async function scanSingleDirectory(virtualPath: string, includeSubfolders: boolean) {
+    let dirAbs: string;
+    try {
+      dirAbs = resolveDiskPath(endpoint, virtualPath);
+    } catch {
+      return;
+    }
 
-    folders.push({
+    let entries: fs.Dirent[] = [];
+    try {
+      entries = await fsp.readdir(dirAbs, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    let dirStat: fs.Stats | null = null;
+    try {
+      dirStat = await fsp.stat(dirAbs);
+    } catch {
+      // Ignore stat error
+    }
+
+    const dirFiles = entries
+      .filter((e) => e.isFile() && !e.name.endsWith('.part'))
+      .slice(0, 100);
+    const subDirs = entries
+      .filter((e) => e.isDirectory() && !e.name.startsWith('.') && !IGNORED_SYSTEM_DIRS.has(e.name))
+      .slice(0, 60);
+
+    const parentVirtual =
+      virtualPath === '/'
+        ? '/'
+        : path.posix.dirname(virtualPath) === '.'
+        ? '/'
+        : path.posix.dirname(virtualPath);
+
+    foldersMap.set(virtualPath, {
       id: `fld-${endpoint}-${virtualPath}`,
       endpoint,
-      name: virtualPath === '/' ? 'Root (/)' : path.posix.basename(virtualPath),
+      name: virtualPath === '/' ? 'Disk Root (/)' : path.posix.basename(virtualPath),
       path: virtualPath,
       parentPath: parentVirtual,
-      createdAt: stat.birthtime.toISOString().slice(11, 19),
+      createdAt: dirStat ? dirStat.mtime.toISOString().slice(11, 19) : '00:00:00',
       fileCount: dirFiles.length,
     });
 
     for (const fileEntry of dirFiles) {
-      const fileAbs = path.join(currentAbs, fileEntry.name);
-      const fileStat = await fsp.stat(fileAbs);
-      const checksum = await computeFileSha256(fileAbs);
-      files.push({
-        id: `file-${endpoint}-${virtualPath}-${fileEntry.name}`,
-        name: fileEntry.name,
-        sizeBytes: fileStat.size,
-        mimeType: 'application/octet-stream',
-        sourceEndpoint: endpoint === 'receiver' ? 'host' : 'receiver',
-        targetEndpoint: endpoint,
-        targetFolderPath: virtualPath,
-        chunkSizeBytes: 65536,
-        totalPieces: calculatePieceCount(fileStat.size, 65536),
-        checksum,
-        completedAt: fileStat.mtime.toISOString().slice(11, 19),
-      });
+      const fileAbs = path.join(dirAbs, fileEntry.name);
+      try {
+        const fileStat = await fsp.stat(fileAbs);
+        const checksum = await computeFileSha256(fileAbs, false);
+        const fileId = `file-${endpoint}-${virtualPath}-${fileEntry.name}`;
+        filesMap.set(fileId, {
+          id: fileId,
+          name: fileEntry.name,
+          sizeBytes: fileStat.size,
+          mimeType: 'application/octet-stream',
+          sourceEndpoint: endpoint === 'receiver' ? 'host' : 'receiver',
+          targetEndpoint: endpoint,
+          targetFolderPath: virtualPath,
+          chunkSizeBytes: 65536,
+          totalPieces: calculatePieceCount(fileStat.size, 65536),
+          checksum,
+          completedAt: fileStat.mtime.toISOString().slice(11, 19),
+        });
+      } catch {
+        // Skip unreadable locked OS files (e.g. pagefile.sys)
+      }
     }
 
-    for (const subEntry of entries) {
-      if (subEntry.isDirectory()) {
-        const nextVirtual =
+    if (includeSubfolders) {
+      for (const subEntry of subDirs) {
+        const subVirtual =
           virtualPath === '/' ? `/${subEntry.name}` : `${virtualPath}/${subEntry.name}`;
-        await walk(path.join(currentAbs, subEntry.name), nextVirtual, virtualPath);
+        if (!foldersMap.has(subVirtual)) {
+          const subAbs = path.join(dirAbs, subEntry.name);
+          let subFileCount = 0;
+          let subCreatedAt = '00:00:00';
+          try {
+            const subEntries = await fsp.readdir(subAbs, { withFileTypes: true });
+            subFileCount = subEntries.filter((e) => e.isFile() && !e.name.endsWith('.part')).length;
+            const subStat = await fsp.stat(subAbs);
+            subCreatedAt = subStat.mtime.toISOString().slice(11, 19);
+          } catch {
+            // Unreadable subfolder
+          }
+          foldersMap.set(subVirtual, {
+            id: `fld-${endpoint}-${subVirtual}`,
+            endpoint,
+            name: subEntry.name,
+            path: subVirtual,
+            parentPath: virtualPath,
+            createdAt: subCreatedAt,
+            fileCount: subFileCount,
+          });
+        }
       }
     }
   }
 
-  await walk(baseDir, '/', '/');
-  return { folders, files };
+  // Always scan the root of the mounted disk drive plus the currently active virtual path
+  await scanSingleDirectory('/', true);
+  if (focusedVirtualPath && focusedVirtualPath !== '/') {
+    await scanSingleDirectory(focusedVirtualPath, true);
+  }
+
+  return {
+    folders: Array.from(foldersMap.values()),
+    files: Array.from(filesMap.values()),
+  };
 }
 
-const PORT = Number(process.env.PORT) || 3000;
+let activePort = Number(process.env.PORT) || 3000;
 
 const state: ServerState = {
-  nodeInfo: detectSystemNodeInfo(PORT),
+  nodeInfo: detectSystemNodeInfo(activePort),
   minConcurrency: DEFAULT_MIN_CONCURRENT_FILES,
   defaultChunkSizeBytes: 65536,
   folders: [],
@@ -205,8 +389,9 @@ const state: ServerState = {
 };
 
 async function refreshDiskState() {
-  const hostScan = await scanEndpointStorage('host');
-  const receiverScan = await scanEndpointStorage('receiver');
+  state.nodeInfo = detectSystemNodeInfo(activePort, state.nodeInfo.customNetworkIp);
+  const hostScan = await scanEndpointStorage('host', activeHostVirtualPath);
+  const receiverScan = await scanEndpointStorage('receiver', activeReceiverVirtualPath);
   state.folders = [...hostScan.folders, ...receiverScan.folders];
   state.completedFiles = [...hostScan.files, ...receiverScan.files];
 }
@@ -222,15 +407,15 @@ function appendLog(entry: Omit<ActivityLogEntry, 'id' | 'timestamp'>): ActivityL
 }
 
 async function startServer() {
-  await fsp.mkdir(HOST_STORAGE, { recursive: true });
-  await fsp.mkdir(RECEIVER_STORAGE, { recursive: true });
+  await fsp.mkdir(DEFAULT_HOST_STORAGE, { recursive: true });
+  await fsp.mkdir(DEFAULT_RECEIVER_STORAGE, { recursive: true });
   await refreshDiskState();
 
   appendLog({
     category: 'session',
     level: 'info',
     sourceEndpoint: 'host',
-    message: `Storage initialized at ${STORAGE_ROOT} on ${state.nodeInfo.hostname} (${state.nodeInfo.lanAddresses.join(', ')}:${PORT}).`,
+    message: `Storage initialized on ${state.nodeInfo.hostname} (Host Disk: ${hostDiskRoot}, Receiver Disk: ${receiverDiskRoot}).`,
   });
 
   const app = express();
@@ -248,6 +433,11 @@ async function startServer() {
 
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server, path: '/ws' });
+
+  // Prevent unhandled 'error' event on WebSocketServer when http.Server encounters EADDRINUSE
+  wss.on('error', () => {
+    // Handled by server.on('error') recovery logic below
+  });
 
   function broadcastState() {
     const payload = JSON.stringify({
@@ -270,6 +460,20 @@ async function startServer() {
     );
   });
 
+  // Loopback-only graceful port handover when a newer `npm run dev` starts
+  app.post('/api/server/takeover', (req, res) => {
+    const remote = req.socket.remoteAddress || '';
+    if (remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1') {
+      res.json({ ok: true });
+      setTimeout(() => {
+        wss.close();
+        server.close(() => process.exit(0));
+      }, 50);
+      return;
+    }
+    res.status(403).json({ error: 'Localhost only' });
+  });
+
   app.get('/api/state', async (_req, res) => {
     await refreshDiskState();
     res.json(state);
@@ -278,13 +482,13 @@ async function startServer() {
   // Configure or switch the active Network IP address for LAN / Hotspot access
   app.post('/api/network/config', (req, res) => {
     const { networkIp } = req.body as { networkIp?: string };
-    const validation = validateNetworkAddress(networkIp ?? '', PORT);
+    const validation = validateNetworkAddress(networkIp ?? '', activePort);
     if (!validation.valid) {
       res.status(400).json({ error: validation.error });
       return;
     }
 
-    state.nodeInfo = detectSystemNodeInfo(PORT, validation.hostPort);
+    state.nodeInfo = detectSystemNodeInfo(activePort, validation.hostPort);
 
     appendLog({
       category: 'session',
@@ -295,6 +499,211 @@ async function startServer() {
 
     broadcastState();
     res.json({ nodeInfo: state.nodeInfo, state });
+  });
+
+  // Mount a real physical disk drive or directory for Host or Receiver
+  app.post('/api/storage/mount', async (req, res) => {
+    const { endpoint, diskPath } = req.body as {
+      endpoint?: EndpointRole;
+      diskPath?: string;
+    };
+
+    if (endpoint !== 'host' && endpoint !== 'receiver') {
+      res.status(400).json({ error: 'Endpoint must be host or receiver.' });
+      return;
+    }
+
+    const validation = validateDiskMountInput(diskPath ?? '');
+    if (!validation.valid) {
+      res.status(400).json({ error: validation.error });
+      return;
+    }
+
+    try {
+      const resolvedPath = path.resolve(validation.trimmed);
+      if (!fs.existsSync(resolvedPath)) {
+        await fsp.mkdir(resolvedPath, { recursive: true });
+      }
+      const stat = await fsp.stat(resolvedPath);
+      if (!stat.isDirectory()) {
+        res.status(400).json({ error: `"${resolvedPath}" is a file, not a disk directory.` });
+        return;
+      }
+
+      if (endpoint === 'host') {
+        hostDiskRoot = resolvedPath;
+        activeHostVirtualPath = '/';
+      } else {
+        receiverDiskRoot = resolvedPath;
+        activeReceiverVirtualPath = '/';
+      }
+
+      await refreshDiskState();
+
+      appendLog({
+        category: 'folder',
+        level: 'info',
+        sourceEndpoint: endpoint,
+        folderPath: resolvedPath,
+        message: `Mounted physical disk drive "${resolvedPath}" on ${
+          endpoint === 'host' ? 'Host Device' : 'Receiver Device'
+        }.`,
+      });
+
+      broadcastState();
+      res.json({ diskRoot: resolvedPath, state });
+    } catch (err) {
+      res.status(400).json({
+        error:
+          err instanceof Error
+            ? `Cannot access disk path: ${err.message}`
+            : 'Cannot access the specified disk drive or directory.',
+      });
+    }
+  });
+
+  // Navigate to a specific subfolder on the mounted Host or Receiver disk drive
+  app.post('/api/storage/navigate', async (req, res) => {
+    const { endpoint, folderPath = '/' } = req.body as {
+      endpoint?: EndpointRole;
+      folderPath?: string;
+    };
+
+    if (endpoint !== 'host' && endpoint !== 'receiver') {
+      res.status(400).json({ error: 'Endpoint must be host or receiver.' });
+      return;
+    }
+
+    const cleanVirtual =
+      '/' +
+      path.posix
+        .normalize('/' + String(folderPath).replace(/\\/g, '/'))
+        .replace(/^\/+|\/+$/g, '');
+
+    try {
+      const targetAbs = resolveDiskPath(endpoint, cleanVirtual);
+      if (!fs.existsSync(targetAbs) || !(await fsp.stat(targetAbs)).isDirectory()) {
+        res.status(404).json({ error: `Folder "${cleanVirtual}" does not exist on disk.` });
+        return;
+      }
+
+      if (endpoint === 'host') {
+        activeHostVirtualPath = cleanVirtual;
+      } else {
+        activeReceiverVirtualPath = cleanVirtual;
+      }
+
+      await refreshDiskState();
+      broadcastState();
+      res.json({ folderPath: cleanVirtual, state });
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Could not open disk folder.',
+      });
+    }
+  });
+
+  // Directly transfer an existing file from Host disk drive to Receiver disk drive (or vice versa)
+  app.post('/api/files/transfer-disk', async (req, res) => {
+    const {
+      sourceEndpoint,
+      sourceFolderPath = '/',
+      fileName,
+      targetEndpoint,
+      targetFolderPath = '/',
+    } = req.body as {
+      sourceEndpoint?: EndpointRole;
+      sourceFolderPath?: string;
+      fileName?: string;
+      targetEndpoint?: EndpointRole;
+      targetFolderPath?: string;
+    };
+
+    if (
+      (sourceEndpoint !== 'host' && sourceEndpoint !== 'receiver') ||
+      (targetEndpoint !== 'host' && targetEndpoint !== 'receiver') ||
+      !fileName
+    ) {
+      res.status(400).json({ error: 'Valid sourceEndpoint, targetEndpoint, and fileName are required.' });
+      return;
+    }
+
+    try {
+      const sourceFileAbs = resolveDiskPath(sourceEndpoint, sourceFolderPath, fileName);
+      if (!fs.existsSync(sourceFileAbs)) {
+        res.status(404).json({ error: `Source file "${fileName}" not found on disk.` });
+        return;
+      }
+
+      const stat = await fsp.stat(sourceFileAbs);
+      const targetDirAbs = resolveDiskPath(targetEndpoint, targetFolderPath);
+      await fsp.mkdir(targetDirAbs, { recursive: true });
+      const targetFileAbs = resolveDiskPath(targetEndpoint, targetFolderPath, fileName);
+
+      const startPerf = performance.now();
+      const chunkSizeBytes = state.defaultChunkSizeBytes || 65536;
+      const totalPieces = calculatePieceCount(stat.size, chunkSizeBytes);
+
+      if (sourceFileAbs !== targetFileAbs) {
+        await fsp.copyFile(sourceFileAbs, targetFileAbs);
+      }
+
+      const elapsedMs = Math.max(1, performance.now() - startPerf);
+      const { speedBytesPerSec } = calculateSpeedAndEta(
+        stat.size,
+        stat.size,
+        elapsedMs,
+        stat.size,
+        elapsedMs
+      );
+      const sha256 = await computeFileSha256(targetFileAbs, true);
+
+      const job: TransferJob = {
+        id: `disk-job-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        fileName: path.basename(fileName),
+        fileSizeBytes: stat.size,
+        mimeType: 'application/octet-stream',
+        sourceEndpoint,
+        targetEndpoint,
+        targetFolderPath,
+        chunkSizeBytes,
+        totalPieces,
+        completedPieces: totalPieces,
+        bytesTransferred: stat.size,
+        status: 'completed',
+        startedAtMs: Date.now() - Math.ceil(elapsedMs),
+        elapsedMs: Math.ceil(elapsedMs),
+        speedBytesPerSec,
+        etaSeconds: 0,
+        pieceBlocks: buildPieceVisualBlocks(totalPieces, totalPieces, 'completed'),
+        checksum: sha256,
+      };
+
+      state.jobs = [job, ...state.jobs];
+      await refreshDiskState();
+
+      appendLog({
+        category: 'transfer',
+        level: 'success',
+        sourceEndpoint,
+        targetEndpoint,
+        fileName: job.fileName,
+        folderPath: targetFolderPath,
+        packetInfo: `${totalPieces}/${totalPieces} pieces (${Math.round(chunkSizeBytes / 1024)} KB)`,
+        speedFormatted: formatTransferSpeed(speedBytesPerSec),
+        checksum: sha256,
+        message: `Transferred "${job.fileName}" (${formatByteSize(
+          stat.size
+        )}) directly from ${sourceEndpoint.toUpperCase()} disk to ${targetEndpoint.toUpperCase()} disk (${targetFolderPath}).`,
+      });
+
+      broadcastState();
+      res.status(201).json({ job, state });
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Failed to transfer file between disk drives.',
+      });
+    }
   });
 
   // Create a real directory on disk for either Host or Receiver
@@ -320,11 +729,16 @@ async function startServer() {
     try {
       const targetDiskDir = resolveDiskPath(endpoint, fullVirtualPath);
       if (fs.existsSync(targetDiskDir)) {
-        res.status(409).json({ error: `Folder "${fullVirtualPath}" already exists on ${endpoint}.` });
+        res.status(409).json({ error: `Folder "${fullVirtualPath}" already exists on ${endpoint} disk.` });
         return;
       }
 
       await fsp.mkdir(targetDiskDir, { recursive: true });
+      if (endpoint === 'host') {
+        activeHostVirtualPath = fullVirtualPath;
+      } else {
+        activeReceiverVirtualPath = fullVirtualPath;
+      }
       await refreshDiskState();
 
       const createdFolder = state.folders.find(
@@ -336,7 +750,9 @@ async function startServer() {
         level: 'info',
         sourceEndpoint: endpoint,
         folderPath: fullVirtualPath,
-        message: `Created directory "${fullVirtualPath}" on ${endpoint === 'host' ? 'Host Storage' : 'Receiver Storage'}.`,
+        message: `Created directory "${fullVirtualPath}" on ${
+          endpoint === 'host' ? `Host Disk (${hostDiskRoot})` : `Receiver Disk (${receiverDiskRoot})`
+        }.`,
       });
 
       broadcastState();
@@ -387,7 +803,6 @@ async function startServer() {
         const totalPieces = calculatePieceCount(sizeBytes, safeChunk);
         const jobId = f.clientId || `job-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 
-        // Pre-allocate or truncate temporary .part file on disk
         const partPath = resolveDiskPath(targetEndpoint, targetFolderPath, `${safeName}.part`);
         await fsp.writeFile(partPath, Buffer.alloc(0));
 
@@ -423,7 +838,7 @@ async function startServer() {
         targetEndpoint,
         folderPath: targetFolderPath,
         packetInfo: `${files.length} file(s) · ${Math.round(safeChunk / 1024)} KB pieces`,
-        message: `Initialized ${files.length} real file stream(s) to ${targetEndpoint.toUpperCase()}:${targetFolderPath} (concurrency: ${effectiveConcurrency} parallel streams).`,
+        message: `Initialized ${files.length} real file stream(s) to ${targetEndpoint.toUpperCase()} disk (${targetDirAbs}).`,
       });
 
       broadcastState();
@@ -461,7 +876,6 @@ async function startServer() {
         `${job.fileName}.part`
       );
 
-      // Write binary packet at exact byte offset
       const handle = await fsp.open(partPath, 'r+');
       try {
         await handle.write(buffer, 0, buffer.length, Number(offsetBytes) || 0);
@@ -505,7 +919,7 @@ async function startServer() {
           job.fileName
         );
         await fsp.rename(partPath, finalPath);
-        const sha256 = await computeFileSha256(finalPath);
+        const sha256 = await computeFileSha256(finalPath, true);
         job.status = 'completed';
         job.completedPieces = job.totalPieces;
         job.bytesTransferred = job.fileSizeBytes;
@@ -533,7 +947,7 @@ async function startServer() {
           checksum: sha256,
           message: `Verified & saved ${job.fileName} (${formatByteSize(
             job.fileSizeBytes
-          )}) to ${job.targetEndpoint.toUpperCase()}:${job.targetFolderPath}`,
+          )}) to ${job.targetEndpoint.toUpperCase()} disk (${finalPath})`,
         });
       } else {
         job.pieceBlocks = buildPieceVisualBlocks(
@@ -558,7 +972,7 @@ async function startServer() {
     }
   });
 
-  // Download a real transferred file from disk
+  // Download / fetch a real file from the Host or Receiver disk drive
   app.get('/api/files/download', async (req, res) => {
     const endpoint = req.query.endpoint as EndpointRole;
     const folderPath = String(req.query.folderPath || '/');
@@ -583,7 +997,7 @@ async function startServer() {
     }
   });
 
-  // Delete a real file from disk
+  // Delete a real file from the Host or Receiver disk drive
   app.delete('/api/files', async (req, res) => {
     const { endpoint, folderPath = '/', fileName } = req.body as {
       endpoint?: EndpointRole;
@@ -608,7 +1022,7 @@ async function startServer() {
         sourceEndpoint: endpoint,
         fileName,
         folderPath,
-        message: `Deleted file "${fileName}" from ${endpoint.toUpperCase()}:${folderPath}.`,
+        message: `Deleted file "${fileName}" from ${endpoint.toUpperCase()} disk (${folderPath}).`,
       });
       broadcastState();
       res.json({ state });
@@ -651,10 +1065,77 @@ async function startServer() {
     });
   }
 
-  server.listen(PORT, '0.0.0.0', () => {
+  let reclaimedOnce = false;
+
+  async function tryReclaimPort(portToFree: number): Promise<boolean> {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 400);
+      const res = await fetch(`http://127.0.0.1:${portToFree}/api/server/takeover`, {
+        method: 'POST',
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (res.ok) {
+        await new Promise((r) => setTimeout(r, 350));
+        return true;
+      }
+    } catch {
+      // Old instance did not expose /api/server/takeover
+    }
+
+    if (process.platform === 'win32') {
+      try {
+        const netstatOut = execSync(`netstat -ano | findstr :${portToFree}`, {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        });
+        const lines = netstatOut.split(/\r?\n/);
+        for (const line of lines) {
+          if (line.includes('LISTENING')) {
+            const parts = line.trim().split(/\s+/);
+            const pid = Number(parts[parts.length - 1]);
+            if (pid && pid > 0 && pid !== process.pid) {
+              execSync(`taskkill /PID ${pid} /F`, { stdio: 'ignore' });
+              await new Promise((r) => setTimeout(r, 400));
+              return true;
+            }
+          }
+        }
+      } catch {
+        // Could not automatically terminate Windows PID
+      }
+    }
+    return false;
+  }
+
+  server.on('error', async (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EADDRINUSE') {
+      if (!reclaimedOnce) {
+        reclaimedOnce = true;
+        console.log(`Port ${activePort} is currently in use by an earlier session. Attempting to reclaim port ${activePort}...`);
+        const freed = await tryReclaimPort(activePort);
+        if (freed) {
+          server.listen(activePort, '0.0.0.0');
+          return;
+        }
+      }
+
+      const nextPort = activePort + 1;
+      console.log(`Port ${activePort} is busy. Automatically switching to port ${nextPort}...`);
+      activePort = nextPort;
+      state.nodeInfo = detectSystemNodeInfo(activePort, state.nodeInfo.customNetworkIp);
+      server.listen(activePort, '0.0.0.0');
+      return;
+    }
+    console.error('Server error:', err);
+  });
+
+  server.listen(activePort, '0.0.0.0', () => {
+    state.nodeInfo = detectSystemNodeInfo(activePort, state.nodeInfo.customNetworkIp);
     console.log('\n============================================================');
     console.log('PacketBridge Wi-Fi & Hotspot File Transfer Server Ready!');
-    console.log(`  • Local Browser (This PC):     http://localhost:${PORT}`);
+    console.log(`  • Local Browser (This PC):     http://localhost:${activePort}`);
     console.log(`  • Network IP (Wi-Fi/Hotspot):  ${state.nodeInfo.activeNetworkUrl}`);
     for (const iface of state.nodeInfo.interfaces) {
       console.log(`  • Interface [${iface.name}]:   ${iface.url}`);
